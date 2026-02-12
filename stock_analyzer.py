@@ -5,9 +5,16 @@ import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import time
 
 # Page configuration
 st.set_page_config(page_title="NSE/BSE Stock Analyzer", layout="wide", page_icon="📈")
+
+# Cache data for 5 minutes to reduce API calls
+@st.cache_data(ttl=300)
+def fetch_stock_data_cached(symbol, period):
+    """Cached wrapper for stock data fetching"""
+    return get_stock_data_internal(symbol, period)
 
 # Title and description
 st.title("📊 NSE/BSE Stock Fair Value & Swing Trading Analyzer")
@@ -17,6 +24,26 @@ st.markdown("*Analyze Indian stocks with valuation metrics, technical indicators
 st.sidebar.header("Stock Selection")
 stock_symbol = st.sidebar.text_input("Enter Stock Symbol (e.g., RELIANCE.NS, TCS.BO)", "RELIANCE.NS").upper()
 st.sidebar.markdown("*Use .NS for NSE, .BO for BSE*")
+
+# Popular stocks quick select
+st.sidebar.markdown("**Popular Stocks:**")
+popular_stocks = {
+    "RELIANCE.NS": "Reliance Industries",
+    "TCS.NS": "TCS",
+    "INFY.NS": "Infosys",
+    "HDFCBANK.NS": "HDFC Bank",
+    "ICICIBANK.NS": "ICICI Bank",
+    "ITC.NS": "ITC",
+    "SBIN.NS": "SBI",
+    "TATAMOTORS.NS": "Tata Motors",
+    "BHARTIARTL.NS": "Airtel",
+    "HINDUNILVR.NS": "HUL"
+}
+
+selected_popular = st.sidebar.selectbox("Or select from popular stocks:", [""] + list(popular_stocks.keys()), format_func=lambda x: f"{popular_stocks.get(x, 'Choose a stock...')}" if x else "Choose a stock...")
+
+if selected_popular:
+    stock_symbol = selected_popular
 
 st.sidebar.header("Analysis Settings")
 analysis_type = st.sidebar.radio("Analysis Type", ["Swing Trading (1 Day - 1 Month)", "Fundamental (Long-term)"], index=0)
@@ -67,16 +94,60 @@ else:
     show_trend = []
 
 # Helper functions
+def get_stock_data_internal(symbol, period="1mo"):
+    """Fetch stock data from Yahoo Finance with retry logic"""
+    import time
+    max_retries = 3
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(symbol)
+            
+            # Try to fetch info first to validate the symbol
+            info = stock.info
+            
+            # Check if we got valid data
+            if not info or 'currentPrice' not in info and 'regularMarketPrice' not in info:
+                # Try alternative method
+                hist = stock.history(period=period, interval="1d")
+                if hist.empty:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        st.error(f"No data available for {symbol}. Please verify the symbol is correct.")
+                        return None, None, None
+                
+                # Create minimal info dict from history
+                info = {
+                    'longName': symbol,
+                    'currentPrice': hist['Close'].iloc[-1] if not hist.empty else 0,
+                    'symbol': symbol
+                }
+            else:
+                hist = stock.history(period=period, interval="1d")
+            
+            if hist is not None and not hist.empty:
+                return stock, info, hist
+            
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                st.error(f"Error fetching data for {symbol}: {str(e)}")
+                st.info("Possible reasons:\n- Invalid stock symbol\n- Temporary API issue\n- Network connectivity\n\nPlease try again in a moment.")
+                return None, None, None
+    
+    return None, None, None
+
 def get_stock_data(symbol, period="1mo"):
-    """Fetch stock data from Yahoo Finance"""
-    try:
-        stock = yf.Ticker(symbol)
-        info = stock.info
-        hist = stock.history(period=period, interval="1d")
-        return stock, info, hist
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return None, None, None
+    """Wrapper function with loading indicator"""
+    with st.spinner(f'Fetching data for {symbol}...'):
+        return fetch_stock_data_cached(symbol, period)
 
 def calculate_technical_indicators(df):
     """Calculate technical indicators for swing trading"""
@@ -494,6 +565,13 @@ def get_recommendation(current_price, fair_values):
 
 # Main analysis
 if stock_symbol:
+    # Add refresh button
+    col_refresh1, col_refresh2 = st.columns([6, 1])
+    with col_refresh2:
+        if st.button("🔄 Refresh Data"):
+            st.cache_data.clear()
+            st.rerun()
+    
     # Determine period based on timeframe
     period_map = {
         "1 Week": "5d",
@@ -507,14 +585,33 @@ if stock_symbol:
     stock, info, hist = get_stock_data(stock_symbol, selected_period)
     
     if info and hist is not None and not hist.empty:
-        current_price = info.get('currentPrice', hist['Close'].iloc[-1])
+        # Try multiple methods to get current price
+        current_price = None
+        
+        # Method 1: currentPrice from info
+        if 'currentPrice' in info and info['currentPrice']:
+            current_price = info['currentPrice']
+        # Method 2: regularMarketPrice from info
+        elif 'regularMarketPrice' in info and info['regularMarketPrice']:
+            current_price = info['regularMarketPrice']
+        # Method 3: Last close price from history
+        elif not hist.empty:
+            current_price = hist['Close'].iloc[-1]
+        
+        if current_price is None or current_price == 0:
+            st.error("Unable to determine current price. Please try another stock or timeframe.")
+            st.stop()
         
         # Display company info
         col1, col2, col3 = st.columns([2, 1, 1])
         
         with col1:
-            st.subheader(f"{info.get('longName', 'N/A')}")
+            st.subheader(f"{info.get('longName', stock_symbol)}")
             st.write(f"**Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')}")
+            # Show last update time
+            if not hist.empty:
+                last_update = hist.index[-1].strftime("%Y-%m-%d %I:%M %p")
+                st.caption(f"📅 Last updated: {last_update}")
         
         with col2:
             change = hist['Close'].iloc[-1] - hist['Close'].iloc[-2] if len(hist) > 1 else 0
